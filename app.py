@@ -1,0 +1,816 @@
+"""AGNI API and production host for the Pyrolens dashboard.
+
+v3: when DATABASE_URL is configured, /api/detections,
+/api/detections/nearby, and /api/regions/summary query PostGIS directly.
+Without it, the same endpoints safely use the verified CSV output. /api/classify still uses
+the CSV-backed `assets()` for its nearest-historic-point feature lookup,
+since the ML model needs the full enriched feature row (land cover, OSM
+distance, spectral indices, etc.) that isn't duplicated in the lighter
+`detections` table -- that table exists specifically to serve the map/API
+fast, not to be the ML feature store.
+"""
+from __future__ import annotations
+
+import os
+import hmac
+from importlib import import_module
+from datetime import date, time
+from functools import lru_cache
+from pathlib import Path
+import json
+import urllib.parse
+import urllib.request
+from typing import Annotated, Literal
+
+import joblib
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+try:
+    from sqlalchemy import create_engine, text
+except ImportError:  # The map can still run from its CSV data without PostGIS.
+    create_engine = text = None
+
+ROOT = Path(__file__).parent
+MODEL_DIR = ROOT / "models"
+PREDICTIONS_PATH = ROOT / "outputs" / "firms_combined_with_predictions_v2.csv"
+# Optional: set DATABASE_URL to enable the PostGIS-backed map API. Keeping
+# this unset makes a fresh clone immediately usable with the verified CSV.
+DB_URL = os.getenv("DATABASE_URL")
+engine = create_engine(DB_URL, pool_pre_ping=True) if DB_URL and create_engine else None
+FIRMS_MAP_KEY = os.getenv("FIRMS_MAP_KEY")
+FIRMS_POLL_TOKEN = os.getenv("FIRMS_POLL_TOKEN")
+FIRMS_LOOKUP_RADIUS_DEGREES = 0.12
+
+UI_CATEGORY = {"offshore_flare_or_platform": "flare"}
+REGION_LABELS = {
+    "punjab_haryana": "Punjab / Haryana, IN", "jharia_raniganj": "Jharia / Raniganj Coalfield, IN",
+    "jamnagar": "Jamnagar, Gujarat, IN", "delhi_ncr": "Delhi / NCR, IN",
+    "california_pnw": "California / Pacific NW, US", "texas_louisiana_gulf": "Texas / Louisiana Gulf Coast, US",
+    "palouse_midwest": "Palouse (WA) / Midwest, US",
+}
+REGION_IDS = {
+    "punjab_haryana": "punjab-haryana", "jharia_raniganj": "jharia-raniganj",
+    "jamnagar": "jamnagar", "delhi_ncr": "delhi-ncr", "california_pnw": "california-pnw",
+    "texas_louisiana_gulf": "gulf-coast", "palouse_midwest": "palouse",
+}
+FEATURE_LABELS = {
+    "bright_ti4": "I4 brightness temperature",
+    "bright_ti5": "I5 brightness temperature",
+    "frp": "Fire radiative power (FRP)",
+    "scan": "Scan pixel size",
+    "track": "Track pixel size",
+    "brightness_temp_diff": "I4–I5 temperature difference",
+    "frp_to_temp_ratio": "FRP-to-brightness ratio",
+    "footprint_proxy": "Pixel footprint",
+    "temp_percentile_in_region": "Regional temperature percentile",
+    "persistence_count_7d": "Detections in the last 7 days",
+    "persistence_count_30d": "Detections in the last 30 days",
+    "persistence_count_90d": "Detections in the last 90 days",
+    "persistence_count_365d": "Detections in the last year",
+    "location_night_fraction": "Night-time detection fraction",
+    "dist_to_industrial_km": "Distance to industrial sites",
+    "dist_to_farmland_km": "Distance to farmland",
+    "dist_to_mining_km": "Distance to mining sites",
+    "month": "Month of year",
+    "day_of_year": "Day of year",
+    "hour": "Hour of acquisition",
+    "confidence_enc": "FIRMS confidence flag",
+    "daynight_enc": "Day/night flag",
+    "satellite_enc": "Satellite",
+    "instrument_enc": "Instrument",
+    "land_cover_class_enc": "Land cover",
+    "industrial_polygon_type_enc": "Nearby industrial polygon",
+    "blue": "Sentinel-2 blue band",
+    "green": "Sentinel-2 green band",
+    "red": "Sentinel-2 red band",
+    "nir": "Sentinel-2 NIR band",
+    "swir1": "Sentinel-2 SWIR1 band",
+    "swir2": "Sentinel-2 SWIR2 band",
+    "ndvi": "NDVI (vegetation index)",
+    "ndbi": "NDBI (built-up index)",
+    "nbr": "NBR (burn index)",
+    "satellite_data_available": "Sentinel-2 coverage",
+    "is_vegetated": "Vegetated pixel",
+    "is_built_up": "Built-up pixel",
+    "burn_signal": "Burn signal",
+}
+LAND_COVER_LABELS = {
+    "bare_sparse": "bare / sparse land", "built_up": "built-up land", "cropland": "cropland",
+    "grassland": "grassland", "shrubland": "shrubland", "tree_cover": "tree cover",
+    "water": "water", "wetland": "wetland",
+}
+CLASS_LABELS = {
+    "agricultural": "agricultural burning", "flare": "a gas flare", "industrial": "industrial activity",
+    "mining": "persistent mining", "offshore_flare_or_platform": "an offshore flare or platform",
+    "wildfire": "a wildfire",
+}
+
+
+class ClassificationRequest(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    frp: float = Field(gt=0, description="Fire radiative power in MW")
+    bright_ti4: float = Field(gt=0, description="VIIRS I4 brightness temperature in K")
+    bright_ti5: float = Field(gt=0, description="VIIRS I5 brightness temperature in K")
+    acq_date: date = Field(description="Satellite acquisition date")
+    acq_time: time = Field(description="Satellite acquisition time in UTC")
+    daynight: Literal["D", "N"] = Field(description="D for daytime or N for nighttime")
+
+
+@lru_cache
+def assets() -> tuple[pd.DataFrame, object, object, list[str], dict[str, object]]:
+    """Load the verified pipeline artifacts once, on first classify request.
+    Still CSV-backed: /api/classify needs the full ML feature row (land
+    cover, OSM distance, spectral indices...) for the nearest-historic-point
+    lookup, which the lighter PostGIS `detections` table doesn't carry."""
+    df = pd.read_csv(PREDICTIONS_PATH)
+    model = joblib.load(MODEL_DIR / "model_xgboost_v2.joblib")
+    label_encoder = joblib.load(MODEL_DIR / "label_encoder_v2.joblib")
+    features = joblib.load(MODEL_DIR / "feature_list_v2.joblib")
+    encoders = joblib.load(MODEL_DIR / "categorical_encoders_v2.joblib")
+    return df, model, label_encoder, features, encoders
+
+
+def ui_category(category: str) -> str:
+    return UI_CATEGORY.get(category, category)
+
+
+_db_synced = False
+
+
+def sync_database_schema_and_acq_times(force: bool = False) -> int:
+    """Ensure detections table has acq_time column and backfill from predictions CSV."""
+    global _db_synced
+    if engine is None:
+        return 0
+    if _db_synced and not force:
+        return 0
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS acq_time INTEGER;"))
+            null_count = conn.execute(text("SELECT count(*) FROM detections WHERE acq_time IS NULL")).scalar()
+            if not null_count:
+                _db_synced = True
+                return 0
+
+            print(f"[db-sync] Backfilling acq_time for {null_count} detections in PostGIS...")
+            if not PREDICTIONS_PATH.exists():
+                print(f"[db-sync] Prediction CSV not found at {PREDICTIONS_PATH}")
+                return 0
+
+            df = pd.read_csv(PREDICTIONS_PATH, usecols=["region", "point_id", "acq_time"])
+            df = df.dropna(subset=["region", "point_id", "acq_time"])
+
+            conn.execute(text("""
+                CREATE TEMP TABLE IF NOT EXISTS tmp_acq_times (
+                    region TEXT,
+                    point_id INTEGER,
+                    acq_time INTEGER
+                ) ON COMMIT DROP;
+                TRUNCATE TABLE tmp_acq_times;
+            """))
+
+            records = [
+                {"reg": str(r.region), "pid": int(r.point_id), "atime": int(r.acq_time)}
+                for _, r in df.iterrows()
+            ]
+
+            insert_tmp_sql = text("INSERT INTO tmp_acq_times (region, point_id, acq_time) VALUES (:reg, :pid, :atime)")
+            batch_size = 5000
+            for i in range(0, len(records), batch_size):
+                conn.execute(insert_tmp_sql, records[i:i + batch_size])
+
+            update_sql = text("""
+                UPDATE detections d
+                SET acq_time = t.acq_time
+                FROM tmp_acq_times t
+                WHERE d.region = t.region
+                  AND d.point_id = t.point_id
+                  AND d.acq_time IS NULL;
+            """)
+            result = conn.execute(update_sql)
+            updated = result.rowcount
+            print(f"[db-sync] Successfully backfilled {updated} detections with real acquisition times.")
+            _db_synced = True
+            return updated
+    except Exception as err:
+        print(f"[db-sync] Warning during automatic DB sync: {err}")
+        return 0
+
+
+@lru_cache
+def postgis_available() -> bool:
+    """Check configured spatial storage once; transparently retain CSV mode on a fresh setup."""
+    if engine is None:
+        return False
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1 FROM detections LIMIT 1"))
+        sync_database_schema_and_acq_times()
+        return True
+    except Exception:
+        return False
+
+
+def format_acq_time(val: object) -> str:
+    if val is None or pd.isna(val) or val == "":
+        return "12:00"
+    raw_time = str(val).split(".")[0].strip()
+    if not raw_time.isdigit():
+        return "12:00"
+    raw_time = raw_time.zfill(4)
+    return f"{raw_time[:2]}:{raw_time[2:]}"
+
+
+def detection_record(row: pd.Series, confidence: float = 0.82) -> dict:
+    category = ui_category(str(row.category))
+    persistence = float(row.persistence_count_30d)
+    persistent = persistence >= 4 or category in {"mining", "flare"}
+    return {
+        "id": f"FIRMS-{int(row.point_id):05d}",
+        "region": REGION_LABELS.get(str(row.region), str(row.region).replace("_", " ").title()),
+        "regionId": REGION_IDS.get(str(row.region), str(row.region)),
+        "lat": float(row.latitude), "lng": float(row.longitude), "category": category,
+        "confidence": round(float(confidence), 3), "frp": round(float(row.frp), 2),
+        "bright_ti4": round(float(row.bright_ti4), 1) if pd.notna(row.get("bright_ti4")) else None,
+        "bright_ti5": round(float(row.bright_ti5), 1) if pd.notna(row.get("bright_ti5")) else None,
+        "acqTime": format_acq_time(row.get("acq_time")),
+        "daynight": str(row.get("daynight", "D")).upper() if pd.notna(row.get("daynight")) else "D",
+        "firstDetected": str(row.acq_date), "persistent": persistent,
+        "activeMonths": round(persistence / 30, 1) if persistent else 0,
+        "anomaly": bool(row.is_anomalous),
+        "source": "NASA FIRMS NRT · VIIRS NOAA-20",
+        "isFirmsHotspot": True,
+    }
+
+
+def nearest_reference(df: pd.DataFrame, lat: float, lng: float) -> pd.Series:
+    """Fill unavailable satellite/context fields from the closest historic FIRMS point."""
+    distance = (df.latitude - lat) ** 2 + ((df.longitude - lng) * np.cos(np.radians(lat))) ** 2
+    return df.loc[distance.idxmin()].copy()
+
+
+def monitored_region(lat: float, lng: float) -> bool:
+    """Allow public live lookups only inside AGNI's configured monitoring areas."""
+    regions = (
+        (74.0, 29.0, 77.5, 32.5), (86.0, 23.5, 87.5, 24.0),
+        (69.5, 22.0, 70.5, 22.7), (76.8, 28.3, 77.6, 28.9),
+        (-124.5, 32.5, -116.0, 49.0), (-97.5, 27.5, -89.0, 31.0),
+        (-118.0, 46.0, -116.5, 47.5),
+    )
+    return any(west <= lng <= east and south <= lat <= north for west, south, east, north in regions)
+
+
+def _pretty_number(value: float) -> str:
+    number = float(value)
+    if abs(number) >= 100 or abs(number - round(number)) < 0.05:
+        return str(int(round(number)))
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def format_feature_value(name: str, row: pd.Series) -> str:
+    raw = row.get(name)
+    if name == "frp":
+        return f"{float(raw):.1f} MW"
+    if name in {"bright_ti4", "bright_ti5"}:
+        return f"{float(raw):.0f} K"
+    if name == "brightness_temp_diff":
+        return f"{float(raw):.1f} K"
+    if name.startswith("dist_to_"):
+        return f"{float(raw):.1f} km"
+    if name.startswith("persistence_count_"):
+        count = int(round(float(raw)))
+        return f"{count} detection{'s' if count != 1 else ''}"
+    if name == "location_night_fraction":
+        return f"{float(raw) * 100:.0f}% night-time"
+    if name in {"is_vegetated", "is_built_up", "satellite_data_available", "burn_signal"}:
+        return "yes" if float(raw) >= 0.5 else "no"
+    if name == "land_cover_class_enc":
+        cover = str(row.get("land_cover_class", ""))
+        return LAND_COVER_LABELS.get(cover, cover.replace("_", " ") or _pretty_number(raw))
+    if name == "industrial_polygon_type_enc":
+        polygon = str(row.get("industrial_polygon_type", "none")).replace("_", " ")
+        return polygon
+    if name == "daynight_enc":
+        return "night" if str(row.get("daynight", "")).upper().startswith("N") else "day"
+    if name == "confidence_enc":
+        flag = str(row.get("confidence", raw))
+        return {"h": "high", "n": "nominal", "l": "low"}.get(flag, str(flag))
+    if name in {"satellite_enc", "instrument_enc"}:
+        key = name.replace("_enc", "")
+        return str(row.get(key, raw))
+    if pd.isna(raw):
+        return "unavailable"
+    return _pretty_number(raw)
+
+
+def feature_contributions(model, frame: pd.DataFrame, class_index: int) -> tuple[np.ndarray, float]:
+    """Tree SHAP contributions for one XGBoost class, excluding the bias term."""
+    booster = model.get_booster()
+    contribs = booster.predict(xgb.DMatrix(frame, feature_names=list(frame.columns)), pred_contribs=True)
+    matrix = np.asarray(contribs)
+    if matrix.ndim == 3:
+        vector = matrix[0, class_index]
+    else:
+        width = matrix.shape[1] // model.n_classes_
+        vector = matrix[0, class_index * width:(class_index + 1) * width]
+    return vector[:-1], float(vector[-1])
+
+
+def explain_prediction(
+    *,
+    request: ClassificationRequest,
+    row: pd.Series,
+    features: list[str],
+    model,
+    label_encoder,
+    raw_class: str,
+    category: str,
+    confidence: float,
+    reference_distance_km: float,
+) -> dict:
+    frame = pd.DataFrame([row[features]])
+    class_index = int(np.where(label_encoder.classes_ == raw_class)[0][0])
+    contribs, _bias = feature_contributions(model, frame, class_index)
+    ranked = sorted(zip(features, contribs, strict=True), key=lambda item: abs(float(item[1])), reverse=True)
+    drivers = []
+    for name, contribution in ranked[:6]:
+        amount = float(contribution)
+        drivers.append({
+            "feature": FEATURE_LABELS.get(name, name.replace("_", " ")),
+            "value": format_feature_value(name, row),
+            "contribution": round(amount, 4),
+            "direction": "supports" if amount >= 0 else "opposes",
+            "source": "submitted" if name in {"frp", "bright_ti4", "bright_ti5", "brightness_temp_diff", "frp_to_temp_ratio", "month", "day_of_year", "hour", "daynight_enc"} else "nearby historic observation",
+        })
+    class_phrase = CLASS_LABELS.get(raw_class, raw_class.replace("_", " "))
+    ui_phrase = CLASS_LABELS.get(category, category)
+    supporting = [item for item in drivers if item["direction"] == "supports"][:3]
+    if supporting:
+        reasons = "; ".join(f"{item['feature']} = {item['value']}" for item in supporting)
+        summary = (
+            f"The saved AGNI XGBoost model classified this location as {ui_phrase} "
+            f"({round(confidence * 100)}% confidence) mainly because {reasons}."
+        )
+    else:
+        summary = (
+            f"The saved AGNI XGBoost model classified this location as {ui_phrase} "
+            f"({round(confidence * 100)}% confidence) from the combined thermal, land-cover, and persistence features."
+        )
+    if raw_class != category and ui_category(raw_class) == category:
+        summary += f" Internally it scored the more specific class {class_phrase}."
+    land_cover = LAND_COVER_LABELS.get(str(row.get("land_cover_class", "")), str(row.get("land_cover_class", "")).replace("_", " "))
+    context = [
+        f"Land cover at the matched historic pixel: {land_cover or 'unknown'}.",
+        f"Neighborhood distances: {float(row['dist_to_farmland_km']):.1f} km to farmland, "
+        f"{float(row['dist_to_industrial_km']):.1f} km to industry, {float(row['dist_to_mining_km']):.1f} km to mining.",
+        f"Persistence at that pixel: {int(round(float(row['persistence_count_30d'])))} "
+        f"detection{'s' if int(round(float(row['persistence_count_30d']))) != 1 else ''} in 30 days, "
+        f"{int(round(float(row['persistence_count_365d'])))} in the last year.",
+        f"Sentinel-2 / OSM context was borrowed from the nearest historic FIRMS observation "
+        f"({reference_distance_km:.0f} km away), because those fields are not entered in this panel.",
+    ]
+    signals = [summary, *context[:3]]
+    return {
+        "summary": summary,
+        "model": "XGBoost v2",
+        "rawClass": raw_class,
+        "drivers": drivers,
+        "context": context,
+        "referenceKm": round(reference_distance_km, 1),
+    }
+
+
+def predict(request: ClassificationRequest) -> dict:
+    df, model, label_encoder, features, encoders = assets()
+    row = nearest_reference(df, request.lat, request.lng)
+    row["frp"] = request.frp
+    row["bright_ti4"] = request.bright_ti4
+    row["bright_ti5"] = request.bright_ti5
+    row["brightness_temp_diff"] = request.bright_ti4 - request.bright_ti5
+    row["frp_to_temp_ratio"] = request.frp / max(float(row["bright_ti4"]), 1)
+    row["footprint_proxy"] = float(row["scan"]) * float(row["track"])
+    row["month"] = request.acq_date.month
+    row["day_of_year"] = request.acq_date.timetuple().tm_yday
+    row["hour"] = request.acq_time.hour
+    row["daynight"] = request.daynight
+    row["daynight_enc"] = encoders["daynight"].transform([request.daynight])[0]
+    probabilities = model.predict_proba(pd.DataFrame([row[features]]))[0]
+    raw_scores = dict(zip(label_encoder.classes_, probabilities, strict=True))
+    scores = {key: 0.0 for key in ("industrial", "flare", "agricultural", "wildfire", "mining")}
+    for key, value in raw_scores.items():
+        scores[ui_category(str(key))] += float(value)
+    category = max(scores, key=scores.get)
+    confidence = scores[category]
+    raw_class = str(max(raw_scores, key=raw_scores.get))
+    reference_distance = float(np.sqrt((float(row.latitude) - request.lat) ** 2 + (float(row.longitude) - request.lng) ** 2) * 111)
+    try:
+        explanation = explain_prediction(
+            request=request, row=row, features=features, model=model, label_encoder=label_encoder,
+            raw_class=raw_class, category=category, confidence=confidence, reference_distance_km=reference_distance,
+        )
+    except Exception:
+        explanation = {
+            "summary": (
+                f"The saved AGNI XGBoost model classified this location as {CLASS_LABELS.get(category, category)} "
+                f"({round(confidence * 100)}% confidence) using thermal, land-cover, persistence, and Sentinel-2 features."
+            ),
+            "model": "XGBoost v2",
+            "rawClass": raw_class,
+            "drivers": [],
+            "context": [
+                f"Satellite, land-cover, and persistence context came from the nearest historic observation ({reference_distance:.0f} km away).",
+                f"Submitted thermal signal: {request.frp:.1f} MW FRP, {request.bright_ti4:.0f} K I4, and {request.bright_ti5:.0f} K I5.",
+            ],
+            "referenceKm": round(reference_distance, 1),
+        }
+    return {
+        "category": category,
+        "confidence": confidence,
+        "scores": scores,
+        "signals": [explanation["summary"], *explanation["context"]],
+        "explanation": explanation,
+    }
+
+
+app = FastAPI(title="Pyrolens Fire Detection API", version="3.0")
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.on_event("startup")
+def on_startup():
+    if engine is not None:
+        sync_database_schema_and_acq_times()
+
+
+@app.get("/api/health")
+def health() -> dict:
+    if postgis_available():
+        with engine.connect() as conn:
+            count = conn.execute(text("SELECT count(*) FROM detections")).scalar_one()
+        storage = "PostGIS"
+    else:
+        df, *_ = assets()
+        count, storage = len(df), "CSV fallback (set DATABASE_URL for PostGIS)"
+    return {"status": "ok", "detections": count, "model": "XGBoost v2", "storage": storage}
+
+
+@app.get("/api/admin/sync-db")
+def admin_sync_db() -> dict:
+    """Explicit endpoint to trigger database migration and backfill of acq_time."""
+    if not postgis_available():
+        return {"status": "skipped", "message": "PostGIS is not enabled or available"}
+    updated = sync_database_schema_and_acq_times(force=True)
+    with engine.connect() as conn:
+        null_count = conn.execute(text("SELECT count(*) FROM detections WHERE acq_time IS NULL")).scalar()
+        total = conn.execute(text("SELECT count(*) FROM detections")).scalar()
+    return {"status": "ok", "updated": updated, "total": total, "null_acq_time_count": null_count}
+
+
+@app.get("/api/firms/nearest")
+def nearest_firms_detection(
+    lat: Annotated[float, Query(ge=-90, le=90)],
+    lng: Annotated[float, Query(ge=-180, le=180)],
+) -> dict:
+    """Return the nearest FIRMS thermal detection for a selected point.
+
+    Tries live NASA FIRMS NRT data if FIRMS_MAP_KEY is available and in a monitored region.
+    Otherwise gracefully falls back to the nearest verified FIRMS observation from the dataset.
+    """
+    if FIRMS_MAP_KEY and monitored_region(lat, lng):
+        west = max(-180, lng - FIRMS_LOOKUP_RADIUS_DEGREES)
+        south = max(-90, lat - FIRMS_LOOKUP_RADIUS_DEGREES)
+        east = min(180, lng + FIRMS_LOOKUP_RADIUS_DEGREES)
+        north = min(90, lat + FIRMS_LOOKUP_RADIUS_DEGREES)
+        url = (
+            "https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
+            f"{FIRMS_MAP_KEY}/VIIRS_NOAA20_NRT/{west},{south},{east},{north}/1"
+        )
+        try:
+            detections = pd.read_csv(url)
+            if not detections.empty:
+                distance = (detections["latitude"] - lat) ** 2 + (
+                    (detections["longitude"] - lng) * np.cos(np.radians(lat))
+                ) ** 2
+                point = detections.loc[distance.idxmin()]
+                return {
+                    "lat": float(point["latitude"]), "lng": float(point["longitude"]),
+                    "frp": float(point["frp"]), "bright_ti4": float(point["bright_ti4"]),
+                    "bright_ti5": float(point["bright_ti5"]), "acq_date": str(point["acq_date"]),
+                    "acq_time": format_acq_time(point.get("acq_time")),
+                    "daynight": str(point.get("daynight", "D")).upper(),
+                    "distance_km": round(float(np.sqrt(distance.loc[point.name]) * 111), 1),
+                    "source": "NASA FIRMS · VIIRS NOAA-20 · latest 24 hours",
+                }
+        except Exception:
+            pass
+
+    # Seamless fallback: nearest verified NASA FIRMS observation from dataset
+    df, *_ = assets()
+    point = nearest_reference(df, lat, lng)
+    distance_km = round(
+        float(np.sqrt((float(point.latitude) - lat) ** 2 + ((float(point.longitude) - lng) * np.cos(np.radians(lat))) ** 2) * 111),
+        1,
+    )
+    return {
+        "lat": float(point["latitude"]),
+        "lng": float(point["longitude"]),
+        "frp": round(float(point["frp"]), 2),
+        "bright_ti4": round(float(point["bright_ti4"]), 1),
+        "bright_ti5": round(float(point["bright_ti5"]), 1),
+        "acq_date": str(point["acq_date"]),
+        "acq_time": format_acq_time(point.get("acq_time")),
+        "daynight": str(point.get("daynight", "D")).upper(),
+        "distance_km": distance_km,
+        "source": "NASA FIRMS Hotspot · VIIRS NOAA-20",
+    }
+
+
+@app.get("/api/detections")
+def detections(region: str | None = None, limit: Annotated[int, Query(ge=1, le=10000)] = 3000) -> list[dict]:
+    """Use PostGIS when configured, otherwise retain a responsive real-CSV map."""
+    if not postgis_available():
+        df, model, _, features, _ = assets()
+        subset = df if not region or region == "all" else df[df.region == region]
+        if subset.empty:
+            raise HTTPException(status_code=404, detail="Unknown region")
+        if len(subset) > limit:
+            subset = subset.sample(n=limit, random_state=42)
+        confidences = model.predict_proba(subset[features]).max(axis=1)
+        return [detection_record(row, confidence) for (_, row), confidence in zip(subset.iterrows(), confidences, strict=True)]
+
+    where_clause = "WHERE region = :region" if region and region != "all" else ""
+
+    # Gracefully handle DB tables that predate the FIRMS telemetry columns
+    # by checking which optional columns actually exist before selecting them.
+    optional_cols = {"acq_time", "bright_ti4", "bright_ti5", "daynight"}
+    with engine.connect() as conn:
+        existing = {
+            row[0]
+            for row in conn.execute(text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'detections' AND column_name = ANY(:cols)"
+            ), {"cols": list(optional_cols)})
+        }
+
+    def col_expr(name: str) -> str:
+        return name if name in existing else f"NULL AS {name}"
+
+    sql = text(f"""
+        SELECT id, point_id, region, category, confidence, frp, latitude, longitude,
+               acq_date, {col_expr('acq_time')}, {col_expr('bright_ti4')},
+               {col_expr('bright_ti5')}, {col_expr('daynight')},
+               persistence_30d, is_anomalous
+        FROM detections
+        {where_clause}
+        ORDER BY random()
+        LIMIT :limit
+    """)
+    params: dict[str, object] = {"limit": limit}
+    if region and region != "all":
+        params["region"] = region
+
+    with engine.connect() as conn:
+        rows = conn.execute(sql, params).mappings().all()
+
+    if not rows and region and region != "all":
+        raise HTTPException(status_code=404, detail="Unknown region")
+
+    result = []
+    for r in rows:
+        result.append({
+            # Historical imports retain their source point_id. Real-time FIRMS
+            # rows have no source point_id, so use Postgres's serial primary key.
+            "id": f"FIRMS-{int(r['point_id'] if r['point_id'] is not None else r['id']):05d}",
+            "region": REGION_LABELS.get(r["region"], r["region"].replace("_", " ").title()),
+            "regionId": REGION_IDS.get(r["region"], r["region"]),
+            "lat": r["latitude"], "lng": r["longitude"],
+            "category": ui_category(r["category"]), "confidence": round(r["confidence"], 3),
+            "frp": round(r["frp"], 2),
+            "bright_ti4": round(float(r["bright_ti4"]), 1) if r["bright_ti4"] is not None else None,
+            "bright_ti5": round(float(r["bright_ti5"]), 1) if r["bright_ti5"] is not None else None,
+            "acqTime": format_acq_time(r["acq_time"]),
+            "daynight": str(r["daynight"]).upper() if r["daynight"] is not None else "D",
+            "firstDetected": str(r["acq_date"]),
+            "persistent": (r["persistence_30d"] or 0) >= 4,
+            "activeMonths": round((r["persistence_30d"] or 0) / 30, 1),
+            "anomaly": bool(r["is_anomalous"]),
+        })
+    return result
+
+
+@app.get("/api/detections/nearby")
+def nearby(lat: float, lng: float, radius_km: float = 50, limit: Annotated[int, Query(ge=1, le=1000)] = 200) -> list[dict]:
+    """Genuine spatial query using the GIST index -- everything within
+    radius_km of a point. No equivalent on a flat CSV without scanning
+    and computing distance for every row on every request."""
+    if not postgis_available():
+        df, *_ = assets()
+        lat_delta = np.radians(df.latitude - lat)
+        lng_delta = np.radians(df.longitude - lng)
+        a = np.sin(lat_delta / 2) ** 2 + np.cos(np.radians(lat)) * np.cos(np.radians(df.latitude)) * np.sin(lng_delta / 2) ** 2
+        candidates = df.assign(km_away=6371 * 2 * np.arcsin(np.sqrt(a)))
+        candidates = candidates[candidates.km_away <= radius_km].nsmallest(limit, "km_away")
+        return [{"point_id": int(row.point_id), "region": row.region, "category": ui_category(row.category), "frp": float(row.frp), "latitude": float(row.latitude), "longitude": float(row.longitude), "km_away": round(float(row.km_away), 2)} for _, row in candidates.iterrows()]
+
+    sql = text("""
+        SELECT point_id, region, category, frp, latitude, longitude,
+               ROUND((ST_Distance(geom::geography,
+                     ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography) / 1000)::numeric, 2) AS km_away
+        FROM detections
+        WHERE ST_DWithin(geom::geography,
+                          ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
+                          :radius_m)
+        ORDER BY km_away
+        LIMIT :limit
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {
+            "lat": lat, "lng": lng, "radius_m": radius_km * 1000, "limit": limit,
+        }).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/regions/summary")
+def regions_summary() -> list[dict]:
+    """Category counts per region, aggregated by Postgres itself."""
+    if not postgis_available():
+        df, *_ = assets()
+        summary = df.assign(category=df.category.map(ui_category)).groupby(["region", "category"], as_index=False).size().rename(columns={"size": "n"})
+        return summary.sort_values(["region", "n"], ascending=[True, False]).to_dict(orient="records")
+
+    sql = text("""
+        SELECT region, category, count(*) AS n
+        FROM detections
+        GROUP BY region, category
+        ORDER BY region, n DESC
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/classify")
+def classify(request: ClassificationRequest) -> dict:
+    return predict(request)
+
+
+@app.post("/api/poll-firms")
+def poll_firms(x_agni_poll_token: Annotated[str | None, Header()] = None) -> dict:
+    """Run the FIRMS ingestion job when invoked by the scheduled GitHub workflow."""
+    if not FIRMS_POLL_TOKEN or not FIRMS_MAP_KEY or not DB_URL:
+        raise HTTPException(status_code=503, detail="FIRMS polling is not configured")
+    if not x_agni_poll_token or not hmac.compare_digest(x_agni_poll_token, FIRMS_POLL_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    poller = import_module("gis.03_realtime_poller")
+    try:
+        return poller.run_realtime_ingestion(database_url=DB_URL, map_key=FIRMS_MAP_KEY)
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"FIRMS polling failed: {error}") from error
+
+
+_geocode_cache: dict[tuple[float, float], dict] = {}
+_facility_cache: dict[tuple[float, float], dict] = {}
+
+
+def facility_type_from_tags(tags: dict[str, str]) -> str:
+    """Translate OpenStreetMap facility tags into cautious user-facing types."""
+    values = " ".join(str(value).lower() for value in tags.values())
+    if any(term in values for term in ("lng", "liquefied natural gas")):
+        return "LNG terminal"
+    if any(term in values for term in ("refinery", "petroleum", "oil refinery")):
+        return "oil refinery"
+    if any(term in values for term in ("petrochemical", "chemical")):
+        return "petrochemical facility"
+    if any(term in values for term in ("steel", "ironworks", "iron works")):
+        return "steel industry"
+    if tags.get("power") == "plant":
+        return "power plant"
+    if any(term in values for term in ("mine", "quarry", "mining")):
+        return "mining operation"
+    return "industrial facility"
+
+
+@app.get("/api/facilities/nearby")
+def nearby_facility(
+    lat: Annotated[float, Query(ge=-90, le=90)],
+    lng: Annotated[float, Query(ge=-180, le=180)],
+) -> dict:
+    """Find the nearest tagged industrial facility in OpenStreetMap.
+
+    This is spatial context for an industrial ML result, not a second model
+    classification. It runs only when an industrial point is inspected.
+    """
+    key = (round(lat, 3), round(lng, 3))
+    if key in _facility_cache:
+        return _facility_cache[key]
+
+    query = f"""
+        [out:json][timeout:12];
+        (
+          nwr(around:10000,{lat},{lng})[\"man_made\"=\"works\"];
+          nwr(around:10000,{lat},{lng})[\"industrial\"];
+          nwr(around:10000,{lat},{lng})[\"power\"=\"plant\"];
+        );
+        out center tags;
+    """
+    request = urllib.request.Request(
+        "https://overpass-api.de/api/interpreter",
+        data=urllib.parse.urlencode({"data": query}).encode(),
+        headers={
+            "User-Agent": "AGNI-Pyrolens/1.0 (industrial-facility context)",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return {"facility": None, "source": "OpenStreetMap", "error": "Facility lookup unavailable"}
+
+    candidates = []
+    for element in payload.get("elements", []):
+        tags = element.get("tags", {})
+        coords = element.get("center", element)
+        facility_lat, facility_lng = coords.get("lat"), coords.get("lon")
+        if facility_lat is None or facility_lng is None:
+            continue
+        distance_km = float(np.sqrt(
+            (float(facility_lat) - lat) ** 2
+            + ((float(facility_lng) - lng) * np.cos(np.radians(lat))) ** 2
+        ) * 111)
+        candidates.append((distance_km, tags))
+
+    if not candidates:
+        result = {"facility": None, "source": "OpenStreetMap"}
+    else:
+        distance_km, tags = min(candidates, key=lambda item: item[0])
+        result = {
+            "facility": {
+                "name": tags.get("name") or tags.get("operator") or "Unnamed mapped facility",
+                "type": facility_type_from_tags(tags),
+                "distance_km": round(distance_km, 1),
+                "evidence": "Nearby facility mapped in OpenStreetMap",
+            },
+            "source": "OpenStreetMap",
+        }
+    if len(_facility_cache) > 1000:
+        _facility_cache.clear()
+    _facility_cache[key] = result
+    return result
+
+
+@app.get("/api/geocode/reverse")
+def reverse_geocode(
+    lat: Annotated[float, Query(ge=-90, le=90)],
+    lon: Annotated[float, Query(ge=-180, le=180)],
+) -> dict:
+    """Reverse-geocode latitude/longitude using OpenStreetMap Nominatim."""
+    rounded_lat = round(lat, 4)
+    rounded_lon = round(lon, 4)
+    key = (rounded_lat, rounded_lon)
+    if key in _geocode_cache:
+        return _geocode_cache[key]
+
+    params = {
+        "format": "jsonv2",
+        "lat": rounded_lat,
+        "lon": rounded_lon,
+        "zoom": 14,
+        "addressdetails": 1,
+    }
+    url = f"https://nominatim.openstreetmap.org/reverse?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "AGNI-Pyrolens/1.0 (NASA-FIRMS Dashboard; contact: support@pyrolens.local)",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                place = data.get("display_name") or data.get("name")
+                result = {"place": place, "lat": rounded_lat, "lon": rounded_lon}
+                if place:
+                    if len(_geocode_cache) > 2000:
+                        _geocode_cache.clear()
+                    _geocode_cache[key] = result
+                return result
+            return {"place": None, "lat": rounded_lat, "lon": rounded_lon, "error": f"OSM status {resp.status}"}
+    except Exception as exc:
+        return {"place": None, "lat": rounded_lat, "lon": rounded_lon, "error": str(exc)}
+
+
+DIST_DIR = ROOT / "dist"
+if DIST_DIR.exists():
+    app.mount("/", StaticFiles(directory=DIST_DIR, html=True), name="dashboard")

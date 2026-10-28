@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: pyrolens-fire-detection
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pyrolens-gis-db
+          property: connectionString
+      - key: FIRMS_MAP_KEY
+        sync: false # Set manually in Render; never commit the NASA FIRMS key.
+      - key: FIRMS_POLL_TOKEN
+        sync: false # Shared secret required by the GitHub Actions scheduler.
+
+databases:
+  - name: pyrolens-gis-db
+    plan: free
+    postgresMajorVersion: "16"
